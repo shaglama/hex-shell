@@ -479,19 +479,19 @@ func:hex_run = int32(string:cmd) {
     int64:pid = -1i64;
 
     if (pipe_idx < 0i64) {
-        pid = raw(process_spawn(cmd,);
+        pid = raw((process_spawn(cmd,
             fd_in_use, g_p0w, g_p1r, fd_out_use,
             g_p2r, g_p2w, g_p3r, g_p3w,
-            g_p4r, g_p4w, g_p5r, g_p5w);
+            g_p4r, g_p4w, g_p5r, g_p5w)));
     }
     if (pipe_idx >= 0i64) {
         string:cmd1 = string_substring(cmd, 0i64, pipe_idx);
         int64:cmd_len = string_length(cmd);
         string:cmd2 = string_substring(cmd, pipe_idx + 1i64, cmd_len);
-        pid = raw(process_spawn2(cmd1, cmd2,);
+        pid = raw((process_spawn2(cmd1, cmd2,
             fd_in_use, g_p0w, g_p1r, fd_out_use,
             g_p2r, g_p2w, g_p3r, g_p3w,
-            g_p4r, g_p4w, g_p5r, g_p5w);
+            g_p4r, g_p4w, g_p5r, g_p5w)));
     }
     if (pid < 0i64) {
         println("hex: spawn failed");

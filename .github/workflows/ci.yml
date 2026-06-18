@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Install LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-20-dev libclang-20-dev clang-20 lld-20 liburing-dev cmake ninja-build
+
+      - name: Create Workspace
+        run: mkdir -p $GITHUB_WORKSPACE/REPOS
+
+      - name: Checkout nitpick
+        uses: actions/checkout@v4
+        with:
+          repository: alternative-intelligence-cp/nitpick
+          path: REPOS/nitpick
+
+      - name: Checkout nitpick-packages
+        uses: actions/checkout@v4
+        with:
+          repository: alternative-intelligence-cp/nitpick-packages
+          path: REPOS/nitpick-packages
+
+      - name: Checkout hex-shell
+        uses: actions/checkout@v4
+        with:
+          path: REPOS/hex-shell
+
+      - name: Build nitpick compiler
+        run: |
+          cd $GITHUB_WORKSPACE/REPOS/nitpick
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+          cmake --build build -j$(nproc)
+
+      - name: Build hex-shell
+        run: |
+          cd $GITHUB_WORKSPACE/REPOS/hex-shell
+          export NITPICK_WORKSPACE=$GITHUB_WORKSPACE/REPOS
+          ./build.sh
