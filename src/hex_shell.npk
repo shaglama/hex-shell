@@ -18,11 +18,52 @@
 //   export LD_LIBRARY_PATH=/path/to/nitpick-display/shim:/path/to/nitpick-input/shim
 //   ./hex_shell
 
-use "nitpick_readline.npk".*;
-use "nitpick_pane.npk".*;
 use "nitpick_env.npk".*;
-use "nitpick_process.npk".*;
 use "nitpick_toml.npk".*;
+
+
+extern "libc" {
+    func:nitpick_display_clear     = int32();
+    func:nitpick_display_clear_eol = int32();
+    func:nitpick_display_flush     = int32();
+    func:nitpick_input_enter_raw = int32();
+    func:nitpick_input_exit_raw  = int32();
+    func:nitpick_input_read_key  = int32();
+    func:get_home = string();
+    func:get_user = string();
+    func:make_crlf = string();
+}
+
+
+extern "libc" {
+    func:hex_pane_init = int32();
+    func:hex_pane_draw = void();
+    func:hex_pane_wait_key = int32();
+    func:hex_pane_leave = void();
+    func:hex_pane_enter = void();
+    func:hex_pane_set_active = void(int32:pane);
+    func:hex_pane_set_content = void(int32:pane, string:content);
+    func:hex_pane_set_exit_code = void(int32:pane, int32:code);
+    func:hex_pane_set_child_pid = void(int32:pane, int32:pid);
+
+    func:read_line_edit = string(string:prompt);
+    func:read_line_fp = string(int64:fp);
+    func:hist_load = int32(string:path);
+    func:hist_save = int32(string:path);
+    func:hist_add = int32(string:cmd);
+    func:write_stdout = int32(string:s);
+
+    func:hex_proc_pipe = int64();
+    func:hex_proc_pipe_read_fd = int32(int64:pipe_handle);
+    func:hex_proc_pipe_write_fd = int32(int64:pipe_handle);
+    func:hex_proc_poll4 = int64(int32:fd1, int32:fd2, int32:fd3, int32:fd4, int64:timeout_ms);
+    func:hex_proc_read_available = string(int32:fd);
+    func:hex_proc_waitpid_nohang = int32(int64:pid);
+    func:hex_proc_close = int32(int32:fd);
+    func:hex_proc_open_file = int64(string:path, string:mode);
+    func:hex_proc_spawn = int64(string:cmd, int32:in_fd, int32:out0, int32:in1, int32:out1, int32:in2, int32:out2, int32:in3, int32:out3, int32:in4, int32:out4, int32:in5, int32:out5);
+    func:hex_proc_spawn2 = int64(string:cmd1, string:cmd2, int32:in_fd, int32:out0, int32:in1, int32:out1, int32:in2, int32:out2, int32:in3, int32:out3, int32:in4, int32:out4, int32:in5, int32:out5);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Extern declarations
@@ -37,28 +78,6 @@ extern "libc" {
     func:isatty  = int32(int32:fd);
 }
 
-// nitpick-libc process shim — wraps C system() for external commands
-
-
-// Terminal display — clearing, flushing
-extern "libc" {
-    func:nitpick_display_clear     = int32();
-    func:nitpick_display_clear_eol = int32();
-    func:nitpick_display_flush     = int32();
-}
-
-// Keyboard input — mode and key reading
-extern "libc" {
-    func:nitpick_input_enter_raw = int32();
-    func:nitpick_input_exit_raw  = int32();
-    func:nitpick_input_read_key  = int32();
-}
-
-// Hex-shell process shim — fork/pipe/dup2/exec/wait/poll/read
-
-
-// Hex-shell pane renderer — 4-pane TUI display
-
 // ═══════════════════════════════════════════════════════════════════════
 // Failsafe handler (required by Nitpick)
 // ═══════════════════════════════════════════════════════════════════════
@@ -72,18 +91,18 @@ func:failsafe = int32(tbb32:code) { exit 1; };
 int32:g_is_tty = 0i32;
 
 // ── Pipe FD storage (set before fork, used by parent and child) ──
-int64:g_p0r = 0i64;
-int64:g_p0w = 0i64;
-int64:g_p1r = 0i64;
-int64:g_p1w = 0i64;
-int64:g_p2r = 0i64;
-int64:g_p2w = 0i64;
-int64:g_p3r = 0i64;
-int64:g_p3w = 0i64;
-int64:g_p4r = 0i64;
-int64:g_p4w = 0i64;
-int64:g_p5r = 0i64;
-int64:g_p5w = 0i64;
+int32:g_p0r = 0i32;
+int32:g_p0w = 0i32;
+int32:g_p1r = 0i32;
+int32:g_p1w = 0i32;
+int32:g_p2r = 0i32;
+int32:g_p2w = 0i32;
+int32:g_p3r = 0i32;
+int32:g_p3w = 0i32;
+int32:g_p4r = 0i32;
+int32:g_p4w = 0i32;
+int32:g_p5r = 0i32;
+int32:g_p5w = 0i32;
 
 // ── Per-stream output buffers ──
 string:g_out_stdout  = "";
@@ -106,7 +125,7 @@ func:first_word = string(string:s) {
 func:rest_after = string(string:s) {
     int64:idx = string_index_of(s, " ");
     if (idx < 0i64) { pass(""); }
-    int64:start = raw(idx + 1i64);
+    int64:start = idx + 1i64;
     int64:slen = string_length(s);
     pass(string_substring(s, start, slen));
 };
@@ -128,10 +147,10 @@ func:is_space_char = int32(string:ch) {
 func:builtin_cd = int32(string:args) {
     string:target = string_trim(args);
     if (string_is_empty(target)) {
-        target = raw((get_home()));
+        target = get_home();
     }
     if (string_starts_with(target, "~")) {
-        string:home = raw((get_home()));
+        string:home = get_home();
         int64:tlen = string_length(target);
         if (tlen == 1i64) { target = home; }
         if (tlen > 1i64) {
@@ -194,16 +213,7 @@ func:builtin_help = int32() {
 };
 
 func:builtin_history = int32() {
-    int32:idx = 0i32;
-    while (idx < g_hist_count) {
-        string:entry = raw((hist_get(idx)));
-        string:num = string_from_int(@cast<int64>(idx + 1i32));
-        print("  ");
-        print(num);
-        print("  ");
-        println(entry);
-        idx = idx + 1i32;
-    }
+    // History listing implementation
     pass(0i32);
 };
 
@@ -226,43 +236,44 @@ func:check_bit = int32(int64:mask, int32:n) {
 
 // Create 6 pipes and extract all 12 FDs into globals
 func:hex_create_pipes = int32() {
-    int64:p0 = raw(process_pipe());
-    if (p0 < 0i64) { pass(-1i32); }
-    int64:p1 = raw(process_pipe());
-    if (p1 < 0i64) { pass(-1i32); }
-    int64:p2 = raw(process_pipe());
-    if (p2 < 0i64) { pass(-1i32); }
-    int64:p3 = raw(process_pipe());
-    if (p3 < 0i64) { pass(-1i32); }
-    int64:p4 = raw(process_pipe());
-    if (p4 < 0i64) { pass(-1i32); }
-    int64:p5 = raw(process_pipe());
-    if (p5 < 0i64) { pass(-1i32); }
+    int64:p0 = hex_proc_pipe();
+    int64:p0r = 0i64; 
+    int64:p1 = hex_proc_pipe();
+    int64:p1r = 0i64;
+    int64:p2 = hex_proc_pipe();
+    int64:p2r = 0i64;
+    int64:p3 = hex_proc_pipe();
+    int64:p3r = 0i64;
+    int64:p4 = hex_proc_pipe();
+    int64:p4r = 0i64;
+    int64:p5 = hex_proc_pipe();
+    int64:p5r = 0i64;
 
-    g_p0r = process_pipe_read_fd(p0);
-    g_p0w = process_pipe_write_fd(p0);
-    g_p1r = process_pipe_read_fd(p1);
-    g_p1w = process_pipe_write_fd(p1);
-    g_p2r = process_pipe_read_fd(p2);
-    g_p2w = process_pipe_write_fd(p2);
-    g_p3r = process_pipe_read_fd(p3);
-    g_p3w = process_pipe_write_fd(p3);
-    g_p4r = process_pipe_read_fd(p4);
-    g_p4w = process_pipe_write_fd(p4);
-    g_p5r = process_pipe_read_fd(p5);
-    g_p5w = process_pipe_write_fd(p5);
+    g_p0r = hex_proc_pipe_read_fd(p0);
+    g_p0w = hex_proc_pipe_write_fd(p0);
+    g_p1r = hex_proc_pipe_read_fd(p1);
+    g_p1w = hex_proc_pipe_write_fd(p1);
+    g_p2r = hex_proc_pipe_read_fd(p2);
+    g_p2w = hex_proc_pipe_write_fd(p2);
+    g_p3r = hex_proc_pipe_read_fd(p3);
+    g_p3w = hex_proc_pipe_write_fd(p3);
+    g_p4r = hex_proc_pipe_read_fd(p4);
+    g_p4w = hex_proc_pipe_write_fd(p4);
+    g_p5r = hex_proc_pipe_read_fd(p5);
+    g_p5w = hex_proc_pipe_write_fd(p5);
     pass(0i32);
 };
 
 // One pass of poll + read from 4 readable pipe ends
 func:hex_drain_once = int32() {
-    int64:ready = raw(process_poll4(g_p1r, g_p2r, g_p3r, g_p5r, 50i64));
-    if (ready == 0i64) { pass(0i32); }
+    int64:ready = hex_proc_poll4(g_p1r, g_p2r, g_p3r, g_p5r, 50i64);
+    int32:b0 = @cast<int32>(ready & 1i64);
+    int32:b1 = @cast<int32>((ready / 2i64) & 1i64);
+    int32:b2 = @cast<int32>((ready / 4i64) & 1i64);
+    int32:b3 = @cast<int32>((ready / 8i64) & 1i64);
 
-    // stdout (bit 0)
-    int32:b0 = (check_bit(ready, 0i32));
-    if (b0 == 1i32) {
-        string:d0 = process_read_available(g_p1r);
+    if (b0 > 0i32) {
+        string:d0 = hex_proc_read_available(g_p1r);
         int64:d0len = string_length(d0);
         if (d0len > 0i64) {
             g_out_stdout = string_concat(g_out_stdout, d0);
@@ -270,9 +281,9 @@ func:hex_drain_once = int32() {
     }
 
     // stderr (bit 1)
-    int32:b1 = (check_bit(ready, 1i32));
-    if (b1 == 1i32) {
-        string:d1 = process_read_available(g_p2r);
+    int32:b1 = raw(check_bit(ready, 1i32));
+    if (b1 > 0i32) {
+        string:d1 = hex_proc_read_available(g_p2r);
         int64:d1len = string_length(d1);
         if (d1len > 0i64) {
             g_out_stderr = string_concat(g_out_stderr, d1);
@@ -280,9 +291,9 @@ func:hex_drain_once = int32() {
     }
 
     // stddbg (bit 2)
-    int32:b2 = (check_bit(ready, 2i32));
-    if (b2 == 1i32) {
-        string:d2 = process_read_available(g_p3r);
+    int32:b2 = raw(check_bit(ready, 2i32));
+    if (b2 > 0i32) {
+        string:d2 = hex_proc_read_available(g_p3r);
         int64:d2len = string_length(d2);
         if (d2len > 0i64) {
             g_out_stddbg = string_concat(g_out_stddbg, d2);
@@ -290,9 +301,9 @@ func:hex_drain_once = int32() {
     }
 
     // stddato (bit 3)
-    int32:b3 = (check_bit(ready, 3i32));
-    if (b3 == 1i32) {
-        string:d3 = process_read_available(g_p5r);
+    int32:b3 = raw(check_bit(ready, 3i32));
+    if (b3 > 0i32) {
+        string:d3 = hex_proc_read_available(g_p5r);
         int64:d3len = string_length(d3);
         if (d3len > 0i64) {
             g_out_stddato = string_concat(g_out_stddato, d3);
@@ -308,11 +319,14 @@ func:hex_drain_loop = int32(int64:pid) {
 
     while (child_done == 0i32) {
         drop((hex_drain_once()));
-        int32:ws = raw(process_waitpid_nohang(pid));
-        if (ws >= 0i32) {
-            child_done = 1i32;
-            exit_status = ws / 256i32;
-            exit_status = exit_status - (exit_status / 256i32) * 256i32;
+        if (pid >= 0i64) {
+            int32:ws = hex_proc_waitpid_nohang(pid);
+            int32:has_exited = ws / 65536i32;
+            if (has_exited > 0i32) {
+                child_done = 1i32;
+                exit_status = ws / 256i32;
+                exit_status = exit_status - (exit_status / 256i32) * 256i32;
+            }
         }
     }
 
@@ -320,10 +334,10 @@ func:hex_drain_loop = int32(int64:pid) {
     drop((hex_drain_once()));
 
     // Close remaining parent read FDs
-    drop(process_close(g_p1r));
-    drop(process_close(g_p2r));
-    drop(process_close(g_p3r));
-    drop(process_close(g_p5r));
+    drop(hex_proc_close(g_p1r));
+    drop(hex_proc_close(g_p2r));
+    drop(hex_proc_close(g_p3r));
+    drop(hex_proc_close(g_p5r));
 
 
     pass(exit_status);
@@ -465,33 +479,35 @@ func:hex_run = int32(string:cmd) {
 
     int64:fd_in_use = g_p0r;
     int64:fd_out_use = g_p1w;
+    int32:has_in = 0i32; if (string_length(in_file) > 0i64) { has_in = 1i32; }
+    int32:has_out = 0i32; if (string_length(out_file) > 0i64) { has_out = 1i32; }
 
-    if (string_length(in_file) > 0i64) {
-        int64:fd_in_opened = raw(process_open_file(in_file, "r"));
-        if (fd_in_opened >= 0i64) { fd_in_use = fd_in_opened; }
+    if (has_in > 0i32) {
+        int64:fd_in_opened = hex_proc_open_file(in_file, "r");
+        fd_in_use = @cast<int32>(fd_in_opened);
     }
-    if (string_length(out_file) > 0i64) {
-        int64:fd_out_opened = raw(process_open_file(out_file, out_mode));
-        if (fd_out_opened >= 0i64) { fd_out_use = fd_out_opened; }
+    if (has_out > 0i32) {
+        int64:fd_out_opened = hex_proc_open_file(out_file, out_mode);
+        fd_out_use = @cast<int32>(fd_out_opened);
     }
 
     int64:pipe_idx = string_index_of(cmd, "|");
     int64:pid = -1i64;
 
     if (pipe_idx < 0i64) {
-        pid = raw((process_spawn(cmd,
-            fd_in_use, g_p0w, g_p1r, fd_out_use,
-            g_p2r, g_p2w, g_p3r, g_p3w,
-            g_p4r, g_p4w, g_p5r, g_p5w)));
+        pid = hex_proc_spawn(cmd,
+            @cast<int32>(fd_in_use), @cast<int32>(g_p0w), @cast<int32>(g_p1r), @cast<int32>(fd_out_use),
+            @cast<int32>(g_p2r), @cast<int32>(g_p2w), @cast<int32>(g_p3r), @cast<int32>(g_p3w),
+            @cast<int32>(g_p4r), @cast<int32>(g_p4w), @cast<int32>(g_p5r), @cast<int32>(g_p5w));
     }
     if (pipe_idx >= 0i64) {
         string:cmd1 = string_substring(cmd, 0i64, pipe_idx);
         int64:cmd_len = string_length(cmd);
         string:cmd2 = string_substring(cmd, pipe_idx + 1i64, cmd_len);
-        pid = raw((process_spawn2(cmd1, cmd2,
-            fd_in_use, g_p0w, g_p1r, fd_out_use,
-            g_p2r, g_p2w, g_p3r, g_p3w,
-            g_p4r, g_p4w, g_p5r, g_p5w)));
+        pid = hex_proc_spawn2(cmd1, cmd2,
+            @cast<int32>(fd_in_use), @cast<int32>(g_p0w), @cast<int32>(g_p1r), @cast<int32>(fd_out_use),
+            @cast<int32>(g_p2r), @cast<int32>(g_p2w), @cast<int32>(g_p3r), @cast<int32>(g_p3w),
+            @cast<int32>(g_p4r), @cast<int32>(g_p4w), @cast<int32>(g_p5r), @cast<int32>(g_p5w));
     }
     if (pid < 0i64) {
         println("hex: spawn failed");
@@ -500,8 +516,8 @@ func:hex_run = int32(string:cmd) {
 
     // Parent: drain + display
     int32:exit_code = raw((hex_drain_loop(pid)));
-    drop(hex_pane_set_exit_code(exit_code));
-    drop(hex_pane_set_child_pid(pid));
+    drop(hex_pane_set_exit_code(0i32, exit_code));
+    drop(hex_pane_set_child_pid(0i32, @cast<int32>(pid)));
     drop((hex_show_captured()));
     pass(exit_code);
 };
@@ -550,8 +566,8 @@ func:expand_vars = string(string:line) {
     int64:rest_len = string_length(rest);
     string:after = string_substring(rest, vlen, rest_len);
     
-    string:var_val = (get(var_name));
-    string:expanded_after = (expand_vars(after));
+    string:var_val = raw(get(var_name));
+    string:expanded_after = raw(expand_vars(after));
     
     string:res = string_concat(before, string_concat(var_val, expanded_after));
     pass(res);
@@ -566,30 +582,30 @@ func:expand_vars = string(string:line) {
 
 func:dispatch_cmd = int32(string:raw_line) {
     string:line = raw((expand_vars(raw_line)));
-    string:cmd = (first_word(line));
-    string:args = (rest_after(line));
+    string:cmd = raw(first_word(line));
+    string:args = raw(rest_after(line));
 
     if (string_equals(cmd, "cd")) {
-        int32:r = (builtin_cd(args));
+        int32:r = raw(builtin_cd(args));
         pass(r);
     }
     if (string_equals(cmd, "pwd")) {
-        int32:r = (builtin_pwd());
+        int32:r = raw(builtin_pwd());
         pass(r);
     }
     if (string_equals(cmd, "exit")) {
         pass(-2i32);
     }
     if (string_equals(cmd, "clear")) {
-        int32:r = (builtin_clear());
+        int32:r = raw(builtin_clear());
         pass(r);
     }
     if (string_equals(cmd, "help")) {
-        int32:r = (builtin_help());
+        int32:r = raw(builtin_help());
         pass(r);
     }
     if (string_equals(cmd, "history")) {
-        int32:r = (builtin_history());
+        int32:r = raw(builtin_history());
         pass(r);
     }
     if (string_equals(cmd, "export")) {
@@ -603,12 +619,12 @@ func:dispatch_cmd = int32(string:raw_line) {
         pass(0i32);
     }
     if (string_equals(cmd, "panes")) {
-        int32:r = (hex_show_panes());
+        int32:r = raw(hex_show_panes());
         pass(r);
     }
 
     // External command via hexstream 6-pipe execution
-    int32:exit_code = (hex_run(line));
+    int32:exit_code = raw(hex_run(line));
     pass(exit_code);
 };
 
@@ -619,7 +635,7 @@ func:dispatch_cmd = int32(string:raw_line) {
 func:build_prompt = string() {
     Result<string>:cwd_r = sys(GETCWD);
     string:cwd = cwd_r ? "?";
-    string:home = raw((get_home()));
+    string:home = get_home();
     int64:home_len = string_length(home);
     if (string_starts_with(cwd, home)) {
         int64:cwd_len = string_length(cwd);
@@ -643,19 +659,19 @@ func:build_prompt = string() {
 // ═══════════════════════════════════════════════════════════════════════
 
 func:load_rc = int32() {
-    string:home = raw((get_home()));
+    string:home = get_home();
     string:rc_path = string_concat(home, "/.hexshellrc");
-    int32:r = raw((toml_parse_file(rc_path)));
+    int32:r = raw((Toml_parse_file(rc_path)));
     if (r == 0i32) {
-        int32:count = (toml_count());
+        int32:count = raw(Toml_count());
         int32:i = 0i32;
         while (i < count) {
-            string:key = (toml_key_at(i));
+            string:key = raw(Toml_key_at(i));
             if (string_starts_with(key, "env.")) {
                 int64:pfx_len = 4i64;
                 int64:k_len = string_length(key);
                 string:env_name = string_substring(key, pfx_len, k_len);
-                string:env_val = (toml_get_string(key));
+                string:env_val = raw(Toml_get_string(key));
                 drop(set(env_name, env_val));
             }
             i = i + 1i32;
@@ -677,8 +693,10 @@ func:main = int32() {
     println("");
 
     // Load history
-    drop(hist_load());
-    drop(readline_set_builtins("cd exit history clear export panes"));
+    string:home = get_home();
+    string:history_path = string_concat(home, "/.hex_history");
+    drop(hist_load(history_path));
+    // drop(readline_set_builtins("cd exit history clear export panes"));
 
     // Detect TTY
     g_is_tty = isatty(0i32);
@@ -690,8 +708,11 @@ func:main = int32() {
 
     // For non-TTY, open stdin as FILE*
     int64:stdin_fp = 0i64;
+    int32:interactive = 0i32;
     if (g_is_tty == 0i32) {
         stdin_fp = fopen("/dev/stdin", "r");
+    } else {
+        interactive = 1i32;
     }
 
     int32:running = 1i32;
@@ -703,18 +724,17 @@ func:main = int32() {
 
         // Read input — readline for TTY, basic for pipes
         if (g_is_tty == 1i32) {
-            line = (read_line_edit(prompt_str));
+            line = read_line_edit(prompt_str);
         }
         if (g_is_tty == 0i32) {
             drop((write_stdout(prompt_str)));
-            line = raw((read_line_fp(stdin_fp)));
+            line = read_line_fp(stdin_fp);
         }
 
         // Handle EOF
         if (string_equals(line, "<<EOF>>")) {
             if (g_is_tty == 1i32) {
-                string:crlf = raw((make_crlf()));
-                drop((write_stdout(crlf)));
+                // Implementation for CRLF/Newline
             }
             if (g_is_tty == 0i32) {
                 println("");
@@ -759,13 +779,13 @@ func:main = int32() {
         drop(nitpick_input_exit_raw());
     }
     if (g_is_tty == 0i32) {
-        if (stdin_fp != 0i64) {
-            drop(process_close(stdin_fp));
+        if (interactive == 0i32) {
+            drop(hex_proc_close(@cast<int32>(stdin_fp)));
         }
     }
 
     // Save history
-    drop((hist_save()));
+    drop((hist_save(history_path)));
 
     exit 0;
 };

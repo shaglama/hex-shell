@@ -36,17 +36,19 @@ case "${1:-build}" in
         echo "  Compiling nitpick_fs shim..."
         gcc -c -O2 -o "$FS_SHIM/nitpick_fs_shim.o" "$FS_SHIM/nitpick_fs_shim.c"
         ar rcs "$FS_SHIM/libnitpick_fs_shim.a" "$FS_SHIM/nitpick_fs_shim.o"
+        ar rcs "$HEX_SHIM/libaria_readline.a" "$SCRIPT_DIR/aria-readline.o"
         # Build Nitpick binary
-        "$ARIAC" src/hex_shell.npk -o hex_shell -I "$WORKSPACE/nitpick-packages/packages/nitpick-readline/src" -I "$WORKSPACE/nitpick-packages/packages/nitpick-pane/src" -I "$WORKSPACE/nitpick-packages/packages/nitpick-env/src" -I "$WORKSPACE/nitpick-packages/packages/nitpick-toml/src" -I "$WORKSPACE/nitpick-packages/packages/nitpick-process/src" \
-            -L "$PROCESS_SHIM" -lnitpick_process \
-            -L "$DISPLAY_SHIM" -lnitpick_display \
+        "$ARIAC" src/hex_shell.npk -o hex_shell -I "$WORKSPACE/nitpick-packages/packages/nitpick-env/src" -I "$WORKSPACE/nitpick-packages/packages/nitpick-toml/src" \
+            -L "$DISPLAY_SHIM" -lnitpick_display_shim \
             -L "$INPUT_SHIM" -lnitpick_input \
             -L "$ENV_SHIM" -lnitpick_env_shim \
             -L "$TOML_SHIM" -lnitpick_toml_shim \
             -L "$FS_SHIM" -lnitpick_fs_shim \
             -L "$HEX_SHIM" -largs_alias \
             -L "$HEX_SHIM" -lhex_pane \
-            -L "$WORKSPACE/nitpick/build_tmp" -lnitpick_runtime
+            -L "$HEX_SHIM" -lhex_process \
+            -L "$HEX_SHIM" -laria_readline \
+            -L "$WORKSPACE/nitpick/build" -lnitpick_runtime
         echo "Built: hex_shell"
         echo "Run with: LD_LIBRARY_PATH=$DISPLAY_SHIM:$INPUT_SHIM:$TOML_SHIM:$PROCESS_SHIM ./hex_shell"
         ;;
