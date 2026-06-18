@@ -1,0 +1,150 @@
+// test_tokenizer.npk — Unit tests for hex-shell string helpers
+//
+// Tests first_word() and rest_after() which form the tokenizer for Phase 1.
+// These are the same functions from hex_shell.npk, duplicated here to avoid
+// diamond import issues.
+//
+// Build:
+//   ariac test/test_tokenizer.npk -o test_tokenizer
+
+// ═══════════════════════════════════════════════════════════════════════
+// Failsafe
+// ═══════════════════════════════════════════════════════════════════════
+
+func:failsafe = int32(tbb32:code) { exit 1; };
+
+// ═══════════════════════════════════════════════════════════════════════
+// Functions under test (duplicated from hex_shell.npk)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:first_word = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) {
+        pass(s);
+    }
+    pass(string_substring(s, 0i64, idx));
+};
+
+func:rest_after = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) {
+        pass("");
+    }
+    int64:start = idx + 1i64;
+    int64:slen = string_length(s);
+    pass(string_substring(s, start, slen));
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test harness
+// ═══════════════════════════════════════════════════════════════════════
+
+int32:g_pass = 0i32;
+int32:g_total = 0i32;
+
+func:assert_str_eq = int32(string:actual, string:expected, string:label) {
+    g_total = g_total + 1i32;
+    if (string_equals(actual, expected)) {
+        g_pass = g_pass + 1i32;
+        pass(0i32);
+    }
+    print("  FAIL: ");
+    print(label);
+    print(" — expected '");
+    print(expected);
+    print("' got '");
+    print(actual);
+    println("'");
+    exit 1;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+func:test_first_word = int32() {
+    println("── first_word ──");
+
+    string:r1 = (first_word("ls"));
+    drop((assert_str_eq(r1, "ls", "single word")));
+
+    string:r2 = (first_word("ls -la"));
+    drop((assert_str_eq(r2, "ls", "two words")));
+
+    string:r3 = (first_word("echo hello world"));
+    drop((assert_str_eq(r3, "echo", "three words")));
+
+    string:r4 = (first_word("cd /tmp"));
+    drop((assert_str_eq(r4, "cd", "cd with path")));
+
+    string:r5 = (first_word(""));
+    drop((assert_str_eq(r5, "", "empty string")));
+
+    string:r6 = (first_word("exit"));
+    drop((assert_str_eq(r6, "exit", "exit command")));
+
+    exit 0;
+};
+
+func:test_rest_after = int32() {
+    println("── rest_after ──");
+
+    string:r1 = (rest_after("ls"));
+    drop((assert_str_eq(r1, "", "single word → empty")));
+
+    string:r2 = (rest_after("ls -la"));
+    drop((assert_str_eq(r2, "-la", "two words")));
+
+    string:r3 = (rest_after("echo hello world"));
+    drop((assert_str_eq(r3, "hello world", "three words")));
+
+    string:r4 = (rest_after("cd /home/randy/Workspace"));
+    drop((assert_str_eq(r4, "/home/randy/Workspace", "path argument")));
+
+    string:r5 = (rest_after(""));
+    drop((assert_str_eq(r5, "", "empty string")));
+
+    string:r6 = (rest_after("cd ~/projects"));
+    drop((assert_str_eq(r6, "~/projects", "tilde path")));
+
+    exit 0;
+};
+
+func:test_combined = int32() {
+    println("── combined tokenize ──");
+
+    string:input = "grep -r pattern src/";
+    string:cmd = (first_word(input));
+    string:args = (rest_after(input));
+
+    drop((assert_str_eq(cmd, "grep", "cmd from compound")));
+    drop((assert_str_eq(args, "-r pattern src/", "args from compound")));
+
+    exit 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main — run all tests
+// ═══════════════════════════════════════════════════════════════════════
+
+func:main = int32() {
+    println("hex-shell tokenizer tests");
+    println("═════════════════════════");
+
+    drop((test_first_word()));
+    drop((test_rest_after()));
+    drop((test_combined()));
+
+    println("");
+    print(string_from_int(@cast<int64>(g_pass)));
+    print("/");
+    print(string_from_int(@cast<int64>(g_total)));
+    println(" tests passed");
+
+    if (g_pass == g_total) {
+        println("ALL PASS");
+        exit 0;
+    }
+    println("SOME FAILURES");
+    exit 1;
+};

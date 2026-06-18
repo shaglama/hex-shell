@@ -1,0 +1,7 @@
+shim/*.o
+shim/*.a
+test/hex_test_writer
+test/test_hex_pipes
+test/test_pane_view
+hex_shell
+test_tokenizer

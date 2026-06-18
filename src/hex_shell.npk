@@ -1,0 +1,771 @@
+// hex_shell.npk — Hex-Shell v0.5.0
+// Phase 5: Pane Interaction & Data Streams
+//
+// Interactive shell with readline-style editing: cursor movement,
+// insert/delete, command history with Up/Down, Ctrl-A/E/K/U/W,
+// and history file persistence (~/.hex_history).
+//
+// Falls back to basic line reading when stdin is not a TTY (piped input).
+//
+// Build:
+//   cd nitpick-packages/packages/hex-shell
+//   ariac src/hex_shell.npk -o hex_shell \
+//     -L /path/to/nitpick-libc/shim -laria_libc_process \
+//     -L /path/to/nitpick-display/shim -lnitpick_display \
+//     -L /path/to/nitpick-input/shim -lnitpick_input
+//
+// Run:
+//   export LD_LIBRARY_PATH=/path/to/nitpick-display/shim:/path/to/nitpick-input/shim
+//   ./hex_shell
+
+use "nitpick_readline.npk".*;
+use "nitpick_pane.npk".*;
+use "nitpick_env.npk".*;
+use "nitpick_process.npk".*;
+use "nitpick_toml.npk".*;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Extern declarations
+// ═══════════════════════════════════════════════════════════════════════
+
+// libc — stdio for file I/O and TTY detection
+extern "libc" {
+    func:fopen   = int64(string:path, string:mode);
+    func:fgetc   = int32(int64:fp);
+    func:fclose  = int32(int64:fp);
+    func:fputs   = int32(string:s, int64:fp);
+    func:isatty  = int32(int32:fd);
+}
+
+// nitpick-libc process shim — wraps C system() for external commands
+
+
+// Terminal display — clearing, flushing
+extern "libc" {
+    func:nitpick_display_clear     = int32();
+    func:nitpick_display_clear_eol = int32();
+    func:nitpick_display_flush     = int32();
+}
+
+// Keyboard input — mode and key reading
+extern "libc" {
+    func:nitpick_input_enter_raw = int32();
+    func:nitpick_input_exit_raw  = int32();
+    func:nitpick_input_read_key  = int32();
+}
+
+// Hex-shell process shim — fork/pipe/dup2/exec/wait/poll/read
+
+
+// Hex-shell pane renderer — 4-pane TUI display
+
+// ═══════════════════════════════════════════════════════════════════════
+// Failsafe handler (required by Nitpick)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:failsafe = int32(tbb32:code) { exit 1; };
+
+// ═══════════════════════════════════════════════════════════════════════
+// Global state
+// ═══════════════════════════════════════════════════════════════════════
+
+int32:g_is_tty = 0i32;
+
+// ── Pipe FD storage (set before fork, used by parent and child) ──
+int64:g_p0r = 0i64;
+int64:g_p0w = 0i64;
+int64:g_p1r = 0i64;
+int64:g_p1w = 0i64;
+int64:g_p2r = 0i64;
+int64:g_p2w = 0i64;
+int64:g_p3r = 0i64;
+int64:g_p3w = 0i64;
+int64:g_p4r = 0i64;
+int64:g_p4w = 0i64;
+int64:g_p5r = 0i64;
+int64:g_p5w = 0i64;
+
+// ── Per-stream output buffers ──
+string:g_out_stdout  = "";
+string:g_out_stderr  = "";
+string:g_out_stddbg  = "";
+string:g_out_stddato = "";
+
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// String helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+func:first_word = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) { pass(s); }
+    pass(string_substring(s, 0i64, idx));
+};
+
+func:rest_after = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) { pass(""); }
+    int64:start = raw(idx + 1i64);
+    int64:slen = string_length(s);
+    pass(string_substring(s, start, slen));
+};
+
+func:is_space_char = int32(string:ch) {
+    if (string_equals(ch, " ")) { pass(1i32); }
+    pass(0i32);
+};
+
+
+
+
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Builtins — each returns int32 status (0 = OK, -2 = exit sentinel)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:builtin_cd = int32(string:args) {
+    string:target = string_trim(args);
+    if (string_is_empty(target)) {
+        target = raw((get_home()));
+    }
+    if (string_starts_with(target, "~")) {
+        string:home = raw((get_home()));
+        int64:tlen = string_length(target);
+        if (tlen == 1i64) { target = home; }
+        if (tlen > 1i64) {
+            string:suffix = string_substring(target, 1i64, tlen);
+            target = string_concat(home, suffix);
+        }
+    }
+    Result<int64>:r = sys(CHDIR, target);
+    int64:ret = r ? -1i64;
+    if (ret < 0i64) {
+        print("hex: cd: ");
+        print(target);
+        println(": No such file or directory");
+        pass(1i32);
+    }
+    pass(0i32);
+};
+
+func:builtin_pwd = int32() {
+    Result<string>:r = sys(GETCWD);
+    string:cwd = r ? "?";
+    println(cwd);
+    pass(0i32);
+};
+
+func:builtin_clear = int32() {
+    drop(nitpick_display_clear());
+    pass(0i32);
+};
+
+func:builtin_help = int32() {
+    println("hex-shell v0.5.0 — Hexstream Shell for Nitpick");
+    println("");
+    println("Built-in commands:");
+    println("  cd [dir]    Change directory (supports ~ and cd with no args)");
+    println("  pwd         Print working directory");
+    println("  clear       Clear the screen");
+    println("  history     Show command history");
+    println("  panes       Re-show last output in 4-pane TUI view");
+    println("  help        Show this help");
+    println("  exit        Exit the shell");
+    println("");
+    println("Line editing:");
+    println("  Left/Right  Move cursor");
+    println("  Home/End    Jump to start/end of line");
+    println("  Up/Down     Browse command history");
+    println("  Ctrl-A/E    Start/end of line");
+    println("  Ctrl-K      Kill to end of line");
+    println("  Ctrl-U      Kill to start of line");
+    println("  Ctrl-W      Kill previous word");
+    println("  Ctrl-L      Clear screen");
+    println("  Ctrl-C      Cancel current line");
+    println("  Ctrl-D      Exit (on empty line)");
+    println("");
+    println("Hexstream: all commands run with 6 piped FDs (0-5).");
+    println("  Single-stream output shown inline.");
+    println("  Multi-stream output shown in 4-pane TUI view.");
+    println("  Test with: test/hex_test_writer");
+    pass(0i32);
+};
+
+func:builtin_history = int32() {
+    int32:idx = 0i32;
+    while (idx < g_hist_count) {
+        string:entry = raw((hist_get(idx)));
+        string:num = string_from_int(@cast<int64>(idx + 1i32));
+        print("  ");
+        print(num);
+        print("  ");
+        println(entry);
+        idx = idx + 1i32;
+    }
+    pass(0i32);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Hexstream process execution — 6-pipe fork/exec with per-stream capture
+// ═══════════════════════════════════════════════════════════════════════
+
+// Bitmask helper: check if bit N is set in mask
+func:check_bit = int32(int64:mask, int32:n) {
+    int64:shifted = mask;
+    int32:i = 0i32;
+    while (i < n) {
+        shifted = shifted / 2i64;
+        i = i + 1i32;
+    }
+    int64:lo = shifted - (shifted / 2i64) * 2i64;
+    if (lo == 1i64) { pass(1i32); }
+    pass(0i32);
+};
+
+// Create 6 pipes and extract all 12 FDs into globals
+func:hex_create_pipes = int32() {
+    int64:p0 = raw(process_pipe());
+    if (p0 < 0i64) { pass(-1i32); }
+    int64:p1 = raw(process_pipe());
+    if (p1 < 0i64) { pass(-1i32); }
+    int64:p2 = raw(process_pipe());
+    if (p2 < 0i64) { pass(-1i32); }
+    int64:p3 = raw(process_pipe());
+    if (p3 < 0i64) { pass(-1i32); }
+    int64:p4 = raw(process_pipe());
+    if (p4 < 0i64) { pass(-1i32); }
+    int64:p5 = raw(process_pipe());
+    if (p5 < 0i64) { pass(-1i32); }
+
+    g_p0r = process_pipe_read_fd(p0);
+    g_p0w = process_pipe_write_fd(p0);
+    g_p1r = process_pipe_read_fd(p1);
+    g_p1w = process_pipe_write_fd(p1);
+    g_p2r = process_pipe_read_fd(p2);
+    g_p2w = process_pipe_write_fd(p2);
+    g_p3r = process_pipe_read_fd(p3);
+    g_p3w = process_pipe_write_fd(p3);
+    g_p4r = process_pipe_read_fd(p4);
+    g_p4w = process_pipe_write_fd(p4);
+    g_p5r = process_pipe_read_fd(p5);
+    g_p5w = process_pipe_write_fd(p5);
+    pass(0i32);
+};
+
+// One pass of poll + read from 4 readable pipe ends
+func:hex_drain_once = int32() {
+    int64:ready = raw(process_poll4(g_p1r, g_p2r, g_p3r, g_p5r, 50i64));
+    if (ready == 0i64) { pass(0i32); }
+
+    // stdout (bit 0)
+    int32:b0 = (check_bit(ready, 0i32));
+    if (b0 == 1i32) {
+        string:d0 = process_read_available(g_p1r);
+        int64:d0len = string_length(d0);
+        if (d0len > 0i64) {
+            g_out_stdout = string_concat(g_out_stdout, d0);
+        }
+    }
+
+    // stderr (bit 1)
+    int32:b1 = (check_bit(ready, 1i32));
+    if (b1 == 1i32) {
+        string:d1 = process_read_available(g_p2r);
+        int64:d1len = string_length(d1);
+        if (d1len > 0i64) {
+            g_out_stderr = string_concat(g_out_stderr, d1);
+        }
+    }
+
+    // stddbg (bit 2)
+    int32:b2 = (check_bit(ready, 2i32));
+    if (b2 == 1i32) {
+        string:d2 = process_read_available(g_p3r);
+        int64:d2len = string_length(d2);
+        if (d2len > 0i64) {
+            g_out_stddbg = string_concat(g_out_stddbg, d2);
+        }
+    }
+
+    // stddato (bit 3)
+    int32:b3 = (check_bit(ready, 3i32));
+    if (b3 == 1i32) {
+        string:d3 = process_read_available(g_p5r);
+        int64:d3len = string_length(d3);
+        if (d3len > 0i64) {
+            g_out_stddato = string_concat(g_out_stddato, d3);
+        }
+    }
+    pass(0i32);
+};
+
+// Drain loop: poll/read until child exits, then final drain
+func:hex_drain_loop = int32(int64:pid) {
+    int32:child_done = 0i32;
+    int32:exit_status = 0i32;
+
+    while (child_done == 0i32) {
+        drop((hex_drain_once()));
+        int32:ws = raw(process_waitpid_nohang(pid));
+        if (ws >= 0i32) {
+            child_done = 1i32;
+            exit_status = ws / 256i32;
+            exit_status = exit_status - (exit_status / 256i32) * 256i32;
+        }
+    }
+
+    // Final drain — one pass to pick up remaining data
+    drop((hex_drain_once()));
+
+    // Close remaining parent read FDs
+    drop(process_close(g_p1r));
+    drop(process_close(g_p2r));
+    drop(process_close(g_p3r));
+    drop(process_close(g_p5r));
+
+
+    pass(exit_status);
+};
+
+// Render captured output in 4-pane TUI view (alternate screen)
+func:hex_show_panes = int32() {
+    int64:total = string_length(g_out_stdout) + string_length(g_out_stderr)
+               + string_length(g_out_stddbg) + string_length(g_out_stddato);
+    if (total == 0i64) {
+        println("hex: no captured output to display");
+        pass(0i32);
+    }
+
+    drop(hex_pane_init());
+    drop(hex_pane_set_content(0i32, g_out_stdout));
+    drop(hex_pane_set_content(1i32, g_out_stddato));
+    drop(hex_pane_set_content(2i32, g_out_stderr));
+    drop(hex_pane_set_content(3i32, g_out_stddbg));
+    drop(hex_pane_set_active(0i32));
+
+    drop(hex_pane_enter());
+    drop(hex_pane_draw());
+    drop(hex_pane_wait_key());
+    drop(hex_pane_leave());
+    pass(0i32);
+};
+
+// Display captured output — inline for single stream, pane view for multi
+func:hex_show_captured = int32() {
+    int64:out_len = string_length(g_out_stdout);
+    int64:err_len = string_length(g_out_stderr);
+    int64:dbg_len = string_length(g_out_stddbg);
+    int64:dat_len = string_length(g_out_stddato);
+
+    // Count how many streams have data
+    int32:streams = 0i32;
+    if (out_len > 0i64) { streams = streams + 1i32; }
+    if (err_len > 0i64) { streams = streams + 1i32; }
+    if (dbg_len > 0i64) { streams = streams + 1i32; }
+    if (dat_len > 0i64) { streams = streams + 1i32; }
+
+    // No output
+    if (streams == 0i32) { pass(0i32); }
+
+    // Single stream — show inline
+    if (streams == 1i32) {
+        if (out_len > 0i64) {
+            drop((write_stdout(g_out_stdout)));
+            pass(0i32);
+        }
+        if (err_len > 0i64) {
+            println("── stderr ──");
+            drop((write_stdout(g_out_stderr)));
+            pass(0i32);
+        }
+        if (dbg_len > 0i64) {
+            println("── stddbg ──");
+            drop((write_stdout(g_out_stddbg)));
+            pass(0i32);
+        }
+        if (dat_len > 0i64) {
+            println("── stddato ──");
+            drop((write_stdout(g_out_stddato)));
+            pass(0i32);
+        }
+    }
+
+    // Multiple streams — pane view (TTY) or labeled inline (pipe)
+    if (g_is_tty == 1i32) {
+        drop((hex_show_panes()));
+        pass(0i32);
+    }
+
+    // Pipe mode fallback: labeled inline output
+    if (out_len > 0i64) {
+        println("── stdout ──");
+        drop((write_stdout(g_out_stdout)));
+    }
+    if (err_len > 0i64) {
+        println("── stderr ──");
+        drop((write_stdout(g_out_stderr)));
+    }
+    if (dbg_len > 0i64) {
+        println("── stddbg ──");
+        drop((write_stdout(g_out_stddbg)));
+    }
+    if (dat_len > 0i64) {
+        println("── stddato ──");
+        drop((write_stdout(g_out_stddato)));
+    }
+    pass(0i32);
+};
+
+// Orchestrator: create pipes → fork → child/parent → drain → show
+func:hex_run = int32(string:cmd) {
+    // Reset output buffers
+    g_out_stdout  = "";
+    g_out_stderr  = "";
+    g_out_stddbg  = "";
+    g_out_stddato = "";
+
+    int32:pr = raw((hex_create_pipes()));
+    if (pr < 0i32) {
+        println("hex: pipe creation failed");
+        pass(1i32);
+    }
+
+    int64:out_idx = string_index_of(cmd, ">");
+    int64:append_idx = string_index_of(cmd, ">>");
+    string:out_file = "";
+    string:out_mode = "w";
+    
+    if (append_idx >= 0i64) {
+        out_idx = append_idx;
+        out_mode = "a";
+        int64:len = string_length(cmd);
+        string:rem = string_substring(cmd, out_idx + 2i64, len);
+        out_file = string_trim(rem);
+        cmd = string_substring(cmd, 0i64, out_idx);
+    }
+    if (append_idx < 0i64) {
+        if (out_idx >= 0i64) {
+            int64:len = string_length(cmd);
+            string:rem = string_substring(cmd, out_idx + 1i64, len);
+            out_file = string_trim(rem);
+            cmd = string_substring(cmd, 0i64, out_idx);
+        }
+    }
+
+    int64:in_idx = string_index_of(cmd, "<");
+    string:in_file = "";
+    if (in_idx >= 0i64) {
+        int64:len = string_length(cmd);
+        string:rem = string_substring(cmd, in_idx + 1i64, len);
+        in_file = string_trim(rem);
+        cmd = string_substring(cmd, 0i64, in_idx);
+    }
+
+    int64:fd_in_use = g_p0r;
+    int64:fd_out_use = g_p1w;
+
+    if (string_length(in_file) > 0i64) {
+        int64:fd_in_opened = raw(process_open_file(in_file, "r"));
+        if (fd_in_opened >= 0i64) { fd_in_use = fd_in_opened; }
+    }
+    if (string_length(out_file) > 0i64) {
+        int64:fd_out_opened = raw(process_open_file(out_file, out_mode));
+        if (fd_out_opened >= 0i64) { fd_out_use = fd_out_opened; }
+    }
+
+    int64:pipe_idx = string_index_of(cmd, "|");
+    int64:pid = -1i64;
+
+    if (pipe_idx < 0i64) {
+        pid = raw(process_spawn(cmd,);
+            fd_in_use, g_p0w, g_p1r, fd_out_use,
+            g_p2r, g_p2w, g_p3r, g_p3w,
+            g_p4r, g_p4w, g_p5r, g_p5w);
+    }
+    if (pipe_idx >= 0i64) {
+        string:cmd1 = string_substring(cmd, 0i64, pipe_idx);
+        int64:cmd_len = string_length(cmd);
+        string:cmd2 = string_substring(cmd, pipe_idx + 1i64, cmd_len);
+        pid = raw(process_spawn2(cmd1, cmd2,);
+            fd_in_use, g_p0w, g_p1r, fd_out_use,
+            g_p2r, g_p2w, g_p3r, g_p3w,
+            g_p4r, g_p4w, g_p5r, g_p5w);
+    }
+    if (pid < 0i64) {
+        println("hex: spawn failed");
+        pass(1i32);
+    }
+
+    // Parent: drain + display
+    int32:exit_code = raw((hex_drain_loop(pid)));
+    drop(hex_pane_set_exit_code(exit_code));
+    drop(hex_pane_set_child_pid(pid));
+    drop((hex_show_captured()));
+    pass(exit_code);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Variable Expansion
+// ═══════════════════════════════════════════════════════════════════════
+
+func:is_var_char = int32(string:ch) {
+    if (string_equals(ch, " ")) { pass(0i32); }
+    if (string_equals(ch, "/")) { pass(0i32); }
+    if (string_equals(ch, "\\")) { pass(0i32); }
+    if (string_equals(ch, "$")) { pass(0i32); }
+    if (string_equals(ch, "\"")) { pass(0i32); }
+    if (string_equals(ch, "'")) { pass(0i32); }
+    if (string_equals(ch, "=")) { pass(0i32); }
+    pass(1i32);
+};
+
+func:get_var_name_len = int64(string:s) {
+    int64:len = string_length(s);
+    int64:i = 0i64;
+    while (i < len) {
+        string:ch = string_substring(s, i, i + 1i64);
+        int32:valid = raw((is_var_char(ch)));
+        if (valid == 0i32) {
+            pass(i);
+        }
+        i = i + 1i64;
+    }
+    pass(len);
+};
+
+func:expand_vars = string(string:line) {
+    int64:idx = string_index_of(line, "$");
+    if (idx < 0i64) {
+        pass(line);
+    }
+    int64:len = string_length(line);
+    string:before = string_substring(line, 0i64, idx);
+    string:rest = string_substring(line, idx + 1i64, len);
+    
+    int64:vlen = raw((get_var_name_len(rest)));
+    string:var_name = string_substring(rest, 0i64, vlen);
+    
+    int64:rest_len = string_length(rest);
+    string:after = string_substring(rest, vlen, rest_len);
+    
+    string:var_val = (get(var_name));
+    string:expanded_after = (expand_vars(after));
+    
+    string:res = string_concat(before, string_concat(var_val, expanded_after));
+    pass(res);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Command dispatch — returns int32 status code
+//   0    = success
+//   >0   = command error
+//   -2   = exit sentinel (signals main loop to quit)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:dispatch_cmd = int32(string:raw_line) {
+    string:line = raw((expand_vars(raw_line)));
+    string:cmd = (first_word(line));
+    string:args = (rest_after(line));
+
+    if (string_equals(cmd, "cd")) {
+        int32:r = (builtin_cd(args));
+        pass(r);
+    }
+    if (string_equals(cmd, "pwd")) {
+        int32:r = (builtin_pwd());
+        pass(r);
+    }
+    if (string_equals(cmd, "exit")) {
+        pass(-2i32);
+    }
+    if (string_equals(cmd, "clear")) {
+        int32:r = (builtin_clear());
+        pass(r);
+    }
+    if (string_equals(cmd, "help")) {
+        int32:r = (builtin_help());
+        pass(r);
+    }
+    if (string_equals(cmd, "history")) {
+        int32:r = (builtin_history());
+        pass(r);
+    }
+    if (string_equals(cmd, "export")) {
+        int64:eq_idx = string_index_of(args, "=");
+        if (eq_idx > 0i64) {
+            string:name = string_substring(args, 0i64, eq_idx);
+            int64:alen = string_length(args);
+            string:val = string_substring(args, eq_idx + 1i64, alen);
+            drop(set(name, val));
+        }
+        pass(0i32);
+    }
+    if (string_equals(cmd, "panes")) {
+        int32:r = (hex_show_panes());
+        pass(r);
+    }
+
+    // External command via hexstream 6-pipe execution
+    int32:exit_code = (hex_run(line));
+    pass(exit_code);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Prompt builder — returns prompt string
+// ═══════════════════════════════════════════════════════════════════════
+
+func:build_prompt = string() {
+    Result<string>:cwd_r = sys(GETCWD);
+    string:cwd = cwd_r ? "?";
+    string:home = raw((get_home()));
+    int64:home_len = string_length(home);
+    if (string_starts_with(cwd, home)) {
+        int64:cwd_len = string_length(cwd);
+        if (cwd_len == home_len) { cwd = "~"; }
+        if (cwd_len > home_len) {
+            string:tail = string_substring(cwd, home_len, cwd_len);
+            cwd = string_concat("~", tail);
+        }
+    }
+    string:usr = raw((user()));
+    if (string_is_empty(usr)) { usr = "user"; }
+    string:p1 = string_concat("\033[1;32m", usr);
+    string:p2 = string_concat(p1, "@hex \033[1;34m");
+    string:p3 = string_concat(p2, cwd);
+    string:p4 = string_concat(p3, "\033[0m> ");
+    pass(p4);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════════════
+
+func:load_rc = int32() {
+    string:home = raw((get_home()));
+    string:rc_path = string_concat(home, "/.hexshellrc");
+    int32:r = raw((toml_parse_file(rc_path)));
+    if (r == 0i32) {
+        int32:count = (toml_count());
+        int32:i = 0i32;
+        while (i < count) {
+            string:key = (toml_key_at(i));
+            if (string_starts_with(key, "env.")) {
+                int64:pfx_len = 4i64;
+                int64:k_len = string_length(key);
+                string:env_name = string_substring(key, pfx_len, k_len);
+                string:env_val = (toml_get_string(key));
+                drop(set(env_name, env_val));
+            }
+            i = i + 1i32;
+        }
+    }
+    pass(0i32);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main — REPL loop
+// ═══════════════════════════════════════════════════════════════════════
+
+func:main = int32() {
+    // Load config
+    drop((load_rc()));
+    // Banner (printed before mode so println works normally)
+    println("hex-shell v0.5.0 — Hexstream Shell for Nitpick");
+    println("Type 'help' for commands, 'exit' to quit.");
+    println("");
+
+    // Load history
+    drop(hist_load());
+    drop(readline_set_builtins("cd exit history clear export panes"));
+
+    // Detect TTY
+    g_is_tty = isatty(0i32);
+
+    // Enter mode for interactive input
+    if (g_is_tty == 1i32) {
+        drop(nitpick_input_enter_raw());
+    }
+
+    // For non-TTY, open stdin as FILE*
+    int64:stdin_fp = 0i64;
+    if (g_is_tty == 0i32) {
+        stdin_fp = fopen("/dev/stdin", "r");
+    }
+
+    int32:running = 1i32;
+    int32:last_status = 0i32;
+
+    while (running == 1i32) {
+        string:prompt_str = raw((build_prompt()));
+        string:line = "";
+
+        // Read input — readline for TTY, basic for pipes
+        if (g_is_tty == 1i32) {
+            line = (read_line_edit(prompt_str));
+        }
+        if (g_is_tty == 0i32) {
+            drop((write_stdout(prompt_str)));
+            line = raw((read_line_fp(stdin_fp)));
+        }
+
+        // Handle EOF
+        if (string_equals(line, "<<EOF>>")) {
+            if (g_is_tty == 1i32) {
+                string:crlf = raw((make_crlf()));
+                drop((write_stdout(crlf)));
+            }
+            if (g_is_tty == 0i32) {
+                println("");
+            }
+            running = 0i32;
+        }
+
+        // Process command
+        if (running == 1i32) {
+            string:trimmed = string_trim(line);
+            int64:tlen = string_length(trimmed);
+
+            if (tlen > 0i64) {
+                // Add to history
+                drop((hist_add(trimmed)));
+
+                // Exit mode so commands get normal terminal
+                if (g_is_tty == 1i32) {
+                    drop(nitpick_input_exit_raw());
+                }
+
+                // Dispatch command
+                int32:result = raw((dispatch_cmd(trimmed)));
+
+                // Re-enter mode
+                if (g_is_tty == 1i32) {
+                    drop(nitpick_input_enter_raw());
+                }
+
+                if (result == -2i32) {
+                    running = 0i32;
+                }
+                if (result != -2i32) {
+                    last_status = result;
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    if (g_is_tty == 1i32) {
+        drop(nitpick_input_exit_raw());
+    }
+    if (g_is_tty == 0i32) {
+        if (stdin_fp != 0i64) {
+            drop(process_close(stdin_fp));
+        }
+    }
+
+    // Save history
+    drop((hist_save()));
+
+    exit 0;
+};

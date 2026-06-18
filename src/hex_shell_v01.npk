@@ -1,0 +1,374 @@
+// hex_shell.npk — Hex-Shell v0.1.0
+// Phase 1: Minimal interactive shell loop
+//
+// A basic POSIX shell written in Nitpick. Reads commands, handles builtins
+// (cd, pwd, exit, clear, help), and runs external commands via /bin/sh.
+// Foundation for the multi-pane hexstream shell.
+//
+// Build:
+//   cd nitpick-packages/packages/hex-shell
+//   ariac src/hex_shell.npk -o hex_shell \
+//     -L /path/to/nitpick-libc/shim -laria_libc_process
+//
+// Run:
+//   ./hex_shell
+
+// ═══════════════════════════════════════════════════════════════════════
+// Extern declarations
+// ═══════════════════════════════════════════════════════════════════════
+
+// libc — stdio for reading stdin char-by-char
+extern "libc" {
+    func:fopen  = int64(string:path, string:mode);
+    func:fgetc  = int32(int64:fp);
+    func:fclose = int32(int64:fp);
+}
+
+// nitpick-libc process shim — wraps C system() for external command execution
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Failsafe handler (required by Nitpick)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:failsafe = int32(tbb32:code) { exit 1; };
+
+// ═══════════════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════════════
+
+int64:SHELL_VERSION_MAJOR = 0i64;
+int64:SHELL_VERSION_MINOR = 1i64;
+
+// ═══════════════════════════════════════════════════════════════════════
+// I/O helpers — defined before callers (Nitpick requires this order)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Write a string directly to stdout (fd 1) — bypasses stdio buffering
+// so the prompt appears immediately before blocking on stdin read.
+func:write_stdout = int32(string:s) {
+    int64:slen = string_length(s);
+    if (slen > 0i64) {
+        Result<int64>:r = sys(WRITE, 1i64, s, slen);
+        int64:written = r ? -1i64;
+    }
+    pass(0i32);
+};
+
+// Read one line from an open FILE* handle until newline or EOF.
+// Returns the line WITHOUT the trailing newline.
+// Returns "<<EOF>>" when EOF is the very first char (Ctrl-D on empty line).
+func:read_line_fp = string(int64:fp) {
+    int32:c = fgetc(fp);
+
+    // Immediate EOF — distinguish from empty Enter
+    if (c < 0i32) {
+        pass("<<EOF>>");
+    }
+
+    // Accumulate chars until newline or EOF
+    string:line = "";
+    while (c >= 0i32) {
+        if (c == 10i32) {
+            // newline — end of line
+            pass(line);
+        }
+        if (c > 0i32) {
+            if (c != 10i32) {
+                line = string_concat(line, string_from_char(@cast<int8>(c)));
+            }
+        }
+        c = fgetc(fp);
+    }
+    // EOF mid-line — return what we have
+    pass(line);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// String helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+// Get first whitespace-delimited word from a string.
+func:first_word = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) {
+        pass(s);
+    }
+    pass(string_substring(s, 0i64, idx));
+};
+
+// Get everything after the first word (skipping the separating space).
+func:rest_after = string(string:s) {
+    int64:idx = string_index_of(s, " ");
+    if (idx < 0i64) {
+        pass("");
+    }
+    int64:start = idx + 1i64;
+    int64:slen = string_length(s);
+    pass(string_substring(s, start, slen));
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Environment — read from /proc/self/environ (initial values only)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Read a specific environment variable from /proc/self/environ.
+// The file is NULL-separated key=value pairs.
+// Returns "" if not found.
+func:read_env_var = string(string:name) {
+    int64:fp = fopen("/proc/self/environ", "r");
+    if (fp == 0i64) { pass(""); }
+
+    string:needle = string_concat(name, "=");
+    int64:needle_len = string_length(needle);
+    string:current = "";
+    int32:c = fgetc(fp);
+
+    while (c >= 0i32) {
+        if (c == 0i32) {
+            // End of one env entry — check if it matches
+            if (string_starts_with(current, needle)) {
+                drop(process_close(fp));
+                int64:clen = string_length(current);
+                pass(string_substring(current, needle_len, clen));
+            }
+            current = "";
+        }
+        if (c > 0i32) {
+            current = string_concat(current, string_from_char(@cast<int8>(c)));
+        }
+        c = fgetc(fp);
+    }
+
+    // Check last entry (environ may not end with NULL byte)
+    if (string_starts_with(current, needle)) {
+        drop(process_close(fp));
+        int64:clen = string_length(current);
+        pass(string_substring(current, needle_len, clen));
+    }
+
+    drop(process_close(fp));
+    pass("");
+};
+
+// Get the user's home directory.
+func:get_home = string() {
+    string:home = raw((read_env_var("HOME")));
+    if (string_is_empty(home)) {
+        pass("/");
+    }
+    pass(home);
+};
+
+// Get the current username.
+func:get_user = string() {
+    string:user = raw((read_env_var("USER")));
+    if (string_is_empty(user)) {
+        pass("aria");
+    }
+    pass(user);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Builtins — each returns int32 status (0 = OK, -2 = exit sentinel)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:builtin_cd = int32(string:args) {
+    string:target = string_trim(args);
+
+    // cd with no args → go home
+    if (string_is_empty(target)) {
+        target = raw((get_home()));
+    }
+
+    // cd ~ → home, cd ~/path → home/path
+    if (string_starts_with(target, "~")) {
+        string:home = raw((get_home()));
+        int64:tlen = string_length(target);
+        if (tlen == 1i64) {
+            target = home;
+        }
+        if (tlen > 1i64) {
+            string:suffix = string_substring(target, 1i64, tlen);
+            target = string_concat(home, suffix);
+        }
+    }
+
+    Result<int64>:r = sys(CHDIR, target);
+    int64:ret = r ? -1i64;
+
+    if (ret < 0i64) {
+        drop((write_stdout("hex: cd: ")));
+        drop((write_stdout(target)));
+        println(": No such file or directory");
+        pass(1i32);
+    }
+    pass(0i32);
+};
+
+func:builtin_pwd = int32() {
+    Result<string>:r = sys(GETCWD);
+    string:cwd = r ? "?";
+    println(cwd);
+    pass(0i32);
+};
+
+func:builtin_clear = int32() {
+    // Run external clear command (ANSI ESC not expressible in Nitpick strings)
+    drop(nitpick_display_clear());
+    pass(0i32);
+};
+
+func:builtin_help = int32() {
+    println("hex-shell v0.1.0 — Hexstream Shell for Nitpick");
+    println("");
+    println("Built-in commands:");
+    println("  cd [dir]   Change directory (supports ~ and cd with no args)");
+    println("  pwd        Print working directory");
+    println("  clear      Clear the screen");
+    println("  help       Show this help");
+    println("  exit       Exit the shell");
+    println("");
+    println("All other commands are executed via /bin/sh.");
+    println("Hexstream panes coming in Phase 4.");
+    pass(0i32);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Command dispatch — returns int32 status code
+//   0    = success
+//   >0   = command error
+//   -2   = exit sentinel (signals main loop to quit)
+// ═══════════════════════════════════════════════════════════════════════
+
+func:dispatch_cmd = int32(string:line) {
+    string:cmd = raw((first_word(line)));
+    string:args = raw((rest_after(line)));
+
+    // ── Builtins ─────────────────────────────────────────────────────
+    if (string_equals(cmd, "cd")) {
+        int32:r = raw((builtin_cd(args)));
+        pass(r);
+    }
+    if (string_equals(cmd, "pwd")) {
+        int32:r = raw((builtin_pwd()));
+        pass(r);
+    }
+    if (string_equals(cmd, "exit")) {
+        pass(-2i32);
+    }
+    if (string_equals(cmd, "clear")) {
+        int32:r = raw((builtin_clear()));
+        pass(r);
+    }
+    if (string_equals(cmd, "help")) {
+        int32:r = raw((builtin_help()));
+        pass(r);
+    }
+
+    // ── External command ─────────────────────────────────────────────
+    // system() returns the wait status. For normal exit: status >> 8 gives
+    // the exit code. C's system() returns -1 on fork/exec failure.
+    int32:status = aria_libc_process_system(line);
+
+    // system() returns -1 on failure
+    if (status < 0i32) {
+        drop((write_stdout("hex: ")));
+        drop((write_stdout(cmd)));
+        println(": command failed");
+        pass(127i32);
+    }
+
+    // Extract exit code: wait status bits 8-15
+    // In C, system() already encodes via WEXITSTATUS for normal exits.
+    // But the value on Linux: exit_code = (status >> 8) & 0xFF
+    int32:code = status / 256i32;
+    // Mask to low 8 bits: code - (code / 256) * 256
+    int32:masked = code - (code / 256i32) * 256i32;
+    pass(masked);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Prompt builder
+// ═══════════════════════════════════════════════════════════════════════
+
+func:show_prompt = int32() {
+    Result<string>:cwd_r = sys(GETCWD);
+    string:cwd = cwd_r ? "?";
+
+    // Shorten home prefix to ~
+    string:home = raw((get_home()));
+    int64:home_len = string_length(home);
+
+    if (string_starts_with(cwd, home)) {
+        int64:cwd_len = string_length(cwd);
+        if (cwd_len == home_len) {
+            cwd = "~";
+        }
+        if (cwd_len > home_len) {
+            string:tail = string_substring(cwd, home_len, cwd_len);
+            cwd = string_concat("~", tail);
+        }
+    }
+
+    string:prompt_str = string_concat("[", string_concat(cwd, "] hex> "));
+    int32:r = raw((write_stdout(prompt_str)));
+    pass(r);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main — REPL loop
+// ═══════════════════════════════════════════════════════════════════════
+
+func:main = int32() {
+    // Banner
+    println("hex-shell v0.1.0 — Hexstream Shell for Nitpick");
+    println("Type 'help' for commands, 'exit' to quit.");
+    println("");
+
+    // Open stdin as FILE* for char-by-char reading
+    int64:stdin_fp = fopen("/dev/stdin", "r");
+    if (stdin_fp == 0i64) {
+        println("hex: fatal: cannot open stdin");
+        exit 1;
+    }
+
+    int32:running = 1i32;
+    int32:last_status = 0i32;
+
+    while (running == 1i32) {
+        // Show prompt
+        drop((show_prompt()));
+
+        // Read line
+        string:line = raw((read_line_fp(stdin_fp)));
+
+        // Handle EOF (Ctrl-D)
+        if (string_equals(line, "<<EOF>>")) {
+            println("");
+            running = 0i32;
+        }
+
+        // Handle empty line — just print next prompt
+        if (running == 1i32) {
+            string:trimmed = string_trim(line);
+            int64:tlen = string_length(trimmed);
+
+            if (tlen > 0i64) {
+                // Dispatch command
+                int32:result = raw((dispatch_cmd(trimmed)));
+
+                // Check exit sentinel
+                if (result == -2i32) {
+                    running = 0i32;
+                }
+                if (result != -2i32) {
+                    last_status = result;
+                }
+            }
+        }
+    }
+
+    drop(process_close(stdin_fp));
+    exit 0;
+};

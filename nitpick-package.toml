@@ -1,0 +1,15 @@
+[package]
+name = "hex-shell"
+version = "0.1.0"
+description = "Multi-pane hexstream shell for Nitpick"
+license = "MIT"
+repository = "https://github.com/alternative-intelligence-cp/nitpick-packages"
+
+[dependencies]
+nitpick-libc = ">=0.2.6"
+nitpick-process = ">=0.1.0"
+nitpick-readline = ">=0.1.0"
+nitpick-pane = ">=0.1.0"
+
+[build]
+link_libraries = ["nitpick_process"]
